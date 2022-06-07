@@ -1,0 +1,225 @@
+name: 2. Deploy to Cluster
+on:
+  workflow_call:
+    secrets:
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      SLACK_BOT_TOKEN:
+        required: true
+    inputs:
+      AWS_REGION:
+        type: string
+        required: true
+      SLACK_CHANNEL:
+        type: string
+        required: true
+      DATABASE_HOST:
+        type: string
+        required: false
+      image-tag:
+        type: string
+        required: true
+      deploy-reference:
+        type: string
+        required: true
+      namespace:
+        type: string
+        required: false
+        default: 'default'
+      project:
+        type: string
+        required: true
+      chart:
+        type: string
+        required: false
+        default: 'kamma-charts/kamma-laravel'
+      domain:
+        type: string
+        required: true
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+      cluster:
+        type: string
+        required: false
+        default: 'kamma-qa-cluster'
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_REFERENCE: ${{ inputs.deploy-reference }}
+
+jobs:
+  deploy:
+    name: Deploy to Kube
+    runs-on: ${{ inputs.runs-on }}
+    environment: production
+
+    steps:
+
+      # IF Production
+      - name: Set Deployment Name
+        id: release
+        run: |
+          if [ "${DEPLOY_NAMESPACE}" = "production"] || [ "${DEPLOY_NAMESPACE}" = "staging"  ]; then
+          echo "::set-output name=name::${DEPLOY_NAMESPACE}"
+          else
+          echo "::set-output name=name::$(echo ${DEPLOY_REFERENCE##*/} | tr '_' '-' | tr '[:upper:]' '[:lower:]')"
+          fi
+        env:
+          DEPLOY_NAMESPACE: ${{ inputs.namespace }}
+
+      - name: Set Deployment Ingress
+        id: ingress
+        run: |
+          if [ "${DEPLOY_NAMESPACE}" = "production"] || [ "${DEPLOY_NAMESPACE}" = "staging"  ]; then
+          echo "::set-output name=name::${DEPLOY_DOMAIN}"
+          else
+          echo "::set-output name=name::${DEPLOY_RELEASE}-${DEPLOY_PROJECT}.${DEPLOY_DOMAIN}"
+          fi
+        env:
+          DEPLOY_RELEASE: ${{ steps.release.outputs.name }}
+          DEPLOY_NAMESPACE: ${{ inputs.namespace }}
+          DEPLOY_PROJECT: ${{ inputs.project }}
+          DEPLOY_DOMAIN: ${{ inputs.domain }}
+
+      # Configure Helm
+      - name: Set up Helm
+        uses: azure/setup-helm@v2.1
+        with:
+          version: v3.8.2
+
+      # Configure the aws credentials use by eks.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1.6.1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.AWS_REGION }}
+          mask-aws-account-id: 'no'
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # v1.24.0 Is currently broken with aws eks - this can be removed when that is fixed
+      # https://github.com/aws/aws-cli/issues/6920
+      - name: Setup Kubectl
+        run: |
+          apt list -a kubectl
+          curl -LO "https://dl.k8s.io/release/v1.23.6/bin/linux/amd64/kubectl"
+          install kubectl /usr/local/bin/kubectl
+
+      # Use EKS to setup the Kubeconfig file with the aws token creation
+      - name: Setup EKS
+        run: |
+          aws eks --region ${{ inputs.AWS_REGION }} update-kubeconfig --name ${{ inputs.cluster }} --role-arn arn:aws:iam::621897733001:role/eksClusterRole
+
+      # Add the Helm Charts for the kamma repo
+      - name: Deliverybot Helm Action
+        id: helm
+        run: |
+          helm repo add kamma-charts https://kammadata.github.io/kamma-charts
+          export HELM_COMMAND="helm upgrade --install ${{ inputs.project }}-${{ steps.release.outputs.name }} --set environment=${{ inputs.namespace }} --set ingress.host=${{ steps.ingress.outputs.name }} --set image.registry=${ECR_REGISTRY} --set image.repository=${{ inputs.project }} --set image.tag=${{ inputs.image-tag }} --set database.host=${{ inputs.DATABASE_HOST }} --set database.name=${{ inputs.project }}-${{ steps.release.outputs.name }} ${{ inputs.chart }}"
+          $HELM_COMMAND
+          echo "::set-output name=command::$(echo "${HELM_COMMAND}")"
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+
+      - name: Post to a Slack channel.
+        id: slack
+        uses: slackapi/slack-github-action@v1.19.0
+        with:
+          channel-id: C011YADU2V8
+          payload: |
+            {
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "A new deployment has been completed:\n*<${{ env.DEPLOYMENT_WORKFLOW_URL }}|Deploy to Cluster>*"
+                        }
+                    },
+                    {
+                        "type": "divider"
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "*Type:* ${{ env.DEPLOYMENT_TYPE }}\n*Ingress:* <https://${{ env.DEPLOYMENT_INGRESS }}|${{ env.DEPLOYMENT_INGRESS }}>\n*Image:* ${{ env.DEPLOYMENT_IMAGE }}\n*Reference:* ${{ env.DEPLOYMENT_REFERENCE }}\n*Namespace:* ${{ env.DEPLOYMENT_NAMESPACE }}\n*Chart:* ${{ env.DEPLOYMENT_CHART }}"
+                        }
+                    },
+                    {
+                        "type": "divider"
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "plain_text",
+                          "text": "kamma kube logs ${{ env.DEPLOYMENT_REFERENCE }}",
+                          "emoji": true
+                        }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "plain_text",
+                          "text": "kamma kube shell ${{ env.DEPLOYMENT_REFERENCE }}",
+                          "emoji": true
+                        }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "plain_text",
+                          "text": "kubectl get pods ${{ env.DEPLOYMENT_REFERENCE }}",
+                          "emoji": true
+                        }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "plain_text",
+                          "text": "helm uninstall ${{ env.DEPLOYMENT_REFERENCE }}",
+                          "emoji": true
+                        }
+                      ]
+                    },
+                    {
+                      "type": "context",
+                      "elements": [
+                        {
+                          "type": "plain_text",
+                          "text": "${{ env.DEPLOYMENT_HELM_COMMAND }}",
+                          "emoji": true
+                        }
+                      ]
+                    }
+                ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DEPLOYMENT_TYPE: "${{ github.event_name }}"
+          DEPLOYMENT_WORKFLOW_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          DEPLOYMENT_INGRESS: "${{ steps.ingress.outputs.name }}"
+          DEPLOYMENT_IMAGE: "${{ inputs.image-tag }}"
+          DEPLOYMENT_IMAGE_URL: "https://${{ steps.login-ecr.outputs.registry }}/${{ inputs.project }}:${{ inputs.image-tag }}"
+          DEPLOYMENT_REFERENCE: "${{ inputs.project }}-${{ steps.release.outputs.name }}"
+          DEPLOYMENT_NAMESPACE: "${{ inputs.namespace }}"
+          DEPLOYMENT_CHART: "${{ inputs.chart }}"
+          DEPLOYMENT_HELM_COMMAND: "${{ steps.helm.outputs.command }}"
+
+

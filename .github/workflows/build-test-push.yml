@@ -1,0 +1,172 @@
+name: 1. Build, Test, Push Docker Image
+
+on:
+  workflow_call:
+    secrets:
+      GIT_PRIVATE_KEY:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+    inputs:
+      ECR_REPOSITORY: # set this to your Amazon ECR repository name
+        type: string
+        required: true
+      AWS_REGION: # set this to your preferred AWS region, e.g. us-west-1
+        type: string
+        required: false
+        default: eu-west-1
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+    outputs:
+      image-tag:
+        description: "Image Tags"
+        value: ${{ jobs.build.outputs.image-tag }}
+
+permissions:
+  checks: write
+  contents: read
+  issues: read
+  pull-requests: write
+
+jobs:
+  build:
+    name: Build Docker Image With Buildx
+    runs-on: ${{ inputs.runs-on }}
+    environment: production
+    outputs:
+      image-tag: ${{ steps.image.outputs.sha }}
+    steps:
+      # Create a network for testing and db docker instances to use.
+      - name: Create Docker Network
+        run: docker network create data
+
+      # Start the process here so it is ready for when testing it ready. //TODO: wait for healthcheck?
+      - name: Setup Mysql
+        run: |
+          docker run --hostname database_testing \
+                    --network data \
+                    -e MYSQL_DATABASE=${{ env.MYSQL_DATABASE }} \
+                    -e MYSQL_USER=${{ env.MYSQL_USER }} \
+                    -e MYSQL_PASSWORD=${{ env.MYSQL_PASSWORD }} \
+                    -e MYSQL_ROOT_PASSWORD=${{ env.MYSQL_ROOT_PASSWORD }} \
+                    -d mysql:8
+        env:
+          MYSQL_DATABASE: database_testing
+          MYSQL_USER: database_testing
+          MYSQL_PASSWORD: database_testing
+          MYSQL_ROOT_PASSWORD: database_testing
+
+      - name: Setup Selenium
+        run: |
+          docker run --hostname selenium \
+                    --network data \
+                    -d selenium/standalone-chrome
+
+      # Checkout the code
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      # Setup buildx for advanced docker features
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@master
+
+      # Get the sha tag for tagging
+      - name: Set Sha Tag
+        id: image
+        run: |
+          echo "::set-output name=sha::sha-$(git rev-parse --short=7 HEAD)"
+
+      # Setup a ssh agent so composer and npm can get secure libraries
+      - uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.GIT_PRIVATE_KEY }}
+
+      # Setup aws
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.AWS_REGION }}
+          mask-aws-account-id: 'no'
+
+      # Login into ECR for pushing images
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # Setup image meta tagging for ECR
+      - name: Prepare meta
+        id: meta
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        uses: docker/metadata-action@v3
+        with:
+          images: |
+            "${{ env.ECR_REGISTRY }}/${{ inputs.ECR_REPOSITORY }}"
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+
+      # Build the devbuild target for testing
+      - name: Build production image
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          builder: ${{ steps.buildx.outputs.name }}
+          file: docker/app/dockerfile
+          push: false # Pre testing
+          tags: kamma/app:test
+          cache-from: type=gha, scope=${{ github.workflow }}
+          cache-to: type=gha, scope=${{ github.workflow }}
+          load: true
+          target: devbuild
+          ssh: |
+            default=${{ env.SSH_AUTH_SOCK }}
+
+      # Test the build
+      - name: Test
+        run: |
+          docker run -v /results:/results --network data --rm kamma/app:test test
+
+      - name: Test Dusk
+        run: |
+          docker run -v /tests/Browser/screenshots:/var/www/tests/Browser/screenshots --network data --hostname app_testing --rm kamma/app:test  dusk:production
+
+      - name: Upload Screenshots
+        if: failure()
+        run: |
+          aws s3 sync /tests/Browser/screenshots s3://bookbuild-dusk/screenshots
+
+#      - name: Results
+#        run: cat results/phpunit/laravel.xml
+#
+#      - name: Publish Unit Test Results
+#        uses: EnricoMi/publish-unit-test-result-action@v1
+#        id: test-results
+#        if: always()
+#        with:
+#          files: "results/**/*.xml"
+
+      # Push the production target to live
+      - name: Build production image
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          builder: ${{ steps.buildx.outputs.name }}
+          file: docker/app/dockerfile
+          push: true # Post testing
+          tags: ${{ steps.meta.outputs.tags }}
+          target: production
+          ssh: |
+            default=${{ env.SSH_AUTH_SOCK }}

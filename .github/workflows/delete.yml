@@ -1,0 +1,101 @@
+name: 2. Delete from Cluster
+on:
+  workflow_call:
+    secrets:
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      SLACK_BOT_TOKEN:
+        required: true
+    inputs:
+      AWS_REGION:
+        type: string
+        required: true
+      SLACK_CHANNEL:
+        type: string
+        required: true
+      deploy-reference:
+        type: string
+        required: true
+      namespace:
+        type: string
+        required: false
+        default: 'default'
+      project:
+        type: string
+        required: true
+      domain:
+        type: string
+        required: true
+      runs-on:
+        type: string
+        required: false
+        default: ubuntu-latest
+      cluster:
+        type: string
+        required: false
+        default: 'kamma-qa-cluster'
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_REFERENCE: ${{ inputs.deploy-reference }}
+
+jobs:
+  deploy:
+    name: Deploy to Kube
+    runs-on: ${{ inputs.runs-on }}
+    environment: production
+
+    steps:
+      - name: Set Deployment Name
+        id: release
+        run: |
+          echo "::set-output name=name::$(echo ${DEPLOY_REFERENCE##*/} | tr '_' '-' | tr '[:upper:]' '[:lower:]')"
+
+      # Configure Helm
+      - name: Set up Helm
+        uses: azure/setup-helm@v2.1
+        with:
+          version: v3.8.2
+
+      # Configure the aws credentials use by eks.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1.6.1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.AWS_REGION }}
+          mask-aws-account-id: 'no'
+
+      # v1.24.0 Is currently broken with aws eks - this can be removed when that is fixed
+      # https://github.com/aws/aws-cli/issues/6920
+      - name: Setup Kubectl
+        run: |
+          apt list -a kubectl
+          curl -LO "https://dl.k8s.io/release/v1.23.6/bin/linux/amd64/kubectl"
+          install kubectl /usr/local/bin/kubectl
+
+      # Use EKS to setup the Kubeconfig file with the aws token creation
+      - name: Setup EKS
+        run: |
+          aws eks --region ${{ inputs.AWS_REGION }} update-kubeconfig --name ${{ inputs.cluster }} --role-arn arn:aws:iam::621897733001:role/eksClusterRole
+
+      # Add the Helm Charts for the kamma repo
+      - name: Deliverybot Helm Action
+        run: |
+          helm uninstall ${{ inputs.project }}-${{ steps.release.outputs.name }} --namespace ${{ inputs.namespace }}
+
+      # Post a success message to slack
+      - name: Post to a Slack channel
+        id: slack
+        uses: slackapi/slack-github-action@v1.19.0
+        with:
+          channel-id: ${{ inputs.SLACK_CHANNEL}}
+          slack-message: "GitHub removed ${{ inputs.deploy-reference }}.${{ inputs.project }}.${{ inputs.domain }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+
