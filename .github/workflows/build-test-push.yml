@@ -164,7 +164,7 @@ jobs:
         with:
           context: .
           builder: ${{ steps.buildx.outputs.name }}
-          file: docker/app/dockerfile
+          file: docker/app/Dockerfile
           push: true # Post testing
           tags: ${{ steps.meta.outputs.tags }}
           target: production
