@@ -124,7 +124,7 @@ jobs:
         with:
           context: .
           builder: ${{ steps.buildx.outputs.name }}
-          file: docker/app/dockerfile
+          file: docker/app/Dockerfile
           push: false # Pre testing
           tags: kamma/app:test
           cache-from: type=gha, scope=${{ github.workflow }}
