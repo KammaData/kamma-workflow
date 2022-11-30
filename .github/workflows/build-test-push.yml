@@ -32,11 +32,16 @@ permissions:
   issues: read
   pull-requests: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build Docker Image With Buildx
     runs-on: ${{ inputs.runs-on }}
     environment: production
+    timeout-minutes: 15
     outputs:
       image-tag: ${{ steps.image.outputs.sha }}
     steps:
