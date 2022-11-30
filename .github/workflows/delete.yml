@@ -40,6 +40,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   DEPLOY_REFERENCE: ${{ inputs.deploy-reference }}
 
@@ -48,6 +52,7 @@ jobs:
     name: Deploy to Kube
     runs-on: ${{ inputs.runs-on }}
     environment: production
+    timeout-minutes: 15
 
     steps:
       - name: Set Deployment Name
